@@ -21,11 +21,15 @@ const (
 	parseColumnValue
 )
 
-// TypedNullString is an extension of the NullString -- it can be null (valid = false)
-// or not null (valid = true), in which case it must have a type and a string
-type TypedNullString struct {
+// ColumnValue is an annotated String type, containing the Postgres type of the String,
+// and whether it was quoted within the original parsing.
+// Quoting is useful for handling values like val[text]:null or val[text]:unchanged-toast-datum,
+// which are special signifiers (denoting null and unchanged data, respectively).
+// Valid is a deprecated field that is set to false when the value is null.
+type ColumnValue struct {
 	String string
 	Type   string
+	Quoted bool
 	Valid  bool
 }
 
@@ -39,16 +43,16 @@ type ParsedTestDecoding struct {
 	SchemaTable string // filled if this is a DML statement with the joined name (<schema>.<table>) for convenience
 	Operation   string // filled if this is a DML statement with the name of the operation (INSERT/UPDATE/DELETE)
 
-	Fields    map[string]TypedNullString // if a DML statement, the fields affected by the operation with their values and types
-	OldFields map[string]TypedNullString // if an UPDATE and REPLICA IDENTITY setting (FULL or USING INDEX both will add values here)
+	Fields    map[string]ColumnValue // if a DML statement, the fields affected by the operation with their values and types
+	OldFields map[string]ColumnValue // if an UPDATE and REPLICA IDENTITY setting (FULL or USING INDEX both will add values here)
 }
 
 // NewParsedTestDecoding creates the structure that is filled by the Parse operation
 func NewParsedTestDecoding(msg string) *ParsedTestDecoding {
 	ptd := new(ParsedTestDecoding)
 	ptd.unparsed = &msg
-	ptd.Fields = make(map[string]TypedNullString)
-	ptd.OldFields = make(map[string]TypedNullString)
+	ptd.Fields = make(map[string]ColumnValue)
+	ptd.OldFields = make(map[string]ColumnValue)
 	return ptd
 }
 
@@ -173,7 +177,7 @@ func (parsed *ParsedTestDecoding) ParseColumns() error {
 	return parseTupleColumns(*parsed.unparsed, &parsed.Fields)
 }
 
-func parseTupleColumns(tuple string, fields *map[string]TypedNullString) error {
+func parseTupleColumns(tuple string, fields *map[string]ColumnValue) error {
 	var columnName string
 	var columnType string
 	var inQuote bool
@@ -214,20 +218,14 @@ func parseTupleColumns(tuple string, fields *map[string]TypedNullString) error {
 					} else if inDoubleQuote {
 						inDoubleQuote = false
 					} else if inQuote && !inDoubleQuote {
-						(*fields)[columnName] = TypedNullString{String: string(s[0:i]), Valid: true, Type: columnType}
+						(*fields)[columnName] = ColumnValue{String: string(s[0:i]), Quoted: inQuote, Type: columnType}
 						if !lastChar {
 							s = s[i+2:]
 							state = parseColumnName
 						}
 					}
 				} else if s[i] == ' ' && !inQuote {
-					valid := true
-
-					if s[0:i] == "null" {
-						valid = false
-					}
-
-					(*fields)[columnName] = TypedNullString{String: string(s[0:i]), Valid: valid, Type: columnType}
+					(*fields)[columnName] = ColumnValue{String: string(s[0:i]), Quoted: inQuote, Type: columnType}
 
 					if !lastChar {
 						s = s[i+1:]
