@@ -25,12 +25,10 @@ const (
 // and whether it was quoted within the original parsing.
 // Quoting is useful for handling values like val[text]:null or val[text]:unchanged-toast-datum,
 // which are special signifiers (denoting null and unchanged data, respectively).
-// Valid is a deprecated field that is set to false when the value is null.
 type ColumnValue struct {
 	String string
 	Type   string
 	Quoted bool
-	Valid  bool
 }
 
 // ParsedTestDecoding is the result of parsing the string
@@ -162,7 +160,7 @@ func (parsed *ParsedTestDecoding) ParseColumns() error {
 		newTupleIdx := strings.Index(*parsed.unparsed, "new-tuple: ")
 
 		if oldTupleIdx > -1 && newTupleIdx > -1 {
-			err := parseTupleColumns((*parsed.unparsed)[oldTupleIdx+9:newTupleIdx], &parsed.OldFields)
+			err := parseTupleColumns((*parsed.unparsed)[oldTupleIdx+9:newTupleIdx-1], &parsed.OldFields)
 			if err != nil {
 				return err
 			}
@@ -198,6 +196,8 @@ func parseTupleColumns(tuple string, fields *map[string]ColumnValue) error {
 					columnName = string(s[0:i])
 					s = s[i+1:]
 					state = parseColumnType
+				} else if s[i] == '(' && s[i:len(s)] == "(no-tuple-data)" {
+					return nil
 				}
 			case parseColumnType:
 				if s[i] == ']' {
@@ -219,22 +219,27 @@ func parseTupleColumns(tuple string, fields *map[string]ColumnValue) error {
 						inDoubleQuote = false
 					} else if inQuote && !inDoubleQuote {
 						(*fields)[columnName] = ColumnValue{String: string(s[0:i]), Quoted: inQuote, Type: columnType}
+						state = parseColumnName
+
 						if !lastChar {
 							s = s[i+2:]
-							state = parseColumnName
 						}
 					}
-				} else if s[i] == ' ' && !inQuote {
-					(*fields)[columnName] = ColumnValue{String: string(s[0:i]), Quoted: inQuote, Type: columnType}
+				} else if (s[i] == ' ' || lastChar) && !inQuote {
+					includeLastChar := 0
+					if lastChar {
+						includeLastChar = 1
+					}
+					(*fields)[columnName] = ColumnValue{String: string(s[0 : i+includeLastChar]), Quoted: inQuote, Type: columnType}
+					state = parseColumnName
 
 					if !lastChar {
 						s = s[i+1:]
-						state = parseColumnName
 					}
 				}
 			}
 
-			if i >= (len(s) - 1) {
+			if lastChar {
 				done = true
 				break
 			}
