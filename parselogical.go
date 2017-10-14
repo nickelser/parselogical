@@ -1,7 +1,6 @@
 package parselogical
 
 import (
-	"fmt"
 	"strings"
 )
 
@@ -10,15 +9,25 @@ import (
 )
 
 const (
-	// prelude section
-	parseSchema uint32 = iota
-	parseTable
-	parseOp
+	parseStateInitial int = iota // start state to determine the message type
 
-	// field data section
-	parseColumnName
-	parseColumnType
-	parseColumnValue
+	// prelude section
+	parseStateRelation          // <schema>.<table>
+	parseStateOperation         // INSERT/UPDATE/DELETE
+	parseStateEscapedIdentifier // applicable to both the column names, and the relation for when "" is used
+
+	// name and type of the column values
+	parseStateColumnName
+	parseStateColumnType
+	parseStateOpenSquareBracket
+
+	// value parsing
+	parseStateColumnValue
+	parseStateColumnQuotedValue
+
+	// terminal states
+	parseStateEnd
+	parseStateNull
 )
 
 // ColumnValue is an annotated String type, containing the Postgres type of the String,
@@ -31,223 +40,232 @@ type ColumnValue struct {
 	Quoted bool
 }
 
-// ParsedTestDecoding is the result of parsing the string
-type ParsedTestDecoding struct {
-	unparsed *string // for internal use
+type parseState struct {
+	msg *string
 
-	Transaction string // filled if this is a transaction statement (BEGIN/COMMIT)
-	Schema      string // filled if this is a DML statement with the name of the schema
-	Table       string // filled if this is a DML statement with the name of the table
-	SchemaTable string // filled if this is a DML statement with the joined name (<schema>.<table>) for convenience
-	Operation   string // filled if this is a DML statement with the name of the operation (INSERT/UPDATE/DELETE)
-
-	Fields    map[string]ColumnValue // if a DML statement, the fields affected by the operation with their values and types
-	OldFields map[string]ColumnValue // if an UPDATE and REPLICA IDENTITY setting (FULL or USING INDEX both will add values here)
+	current       int
+	prev          int
+	tokenStart    int
+	oldKey        bool
+	curColumnName string
+	curColumnType string
 }
 
-// NewParsedTestDecoding creates the structure that is filled by the Parse operation
-func NewParsedTestDecoding(msg string) *ParsedTestDecoding {
-	ptd := new(ParsedTestDecoding)
-	ptd.unparsed = &msg
-	ptd.Fields = make(map[string]ColumnValue)
-	ptd.OldFields = make(map[string]ColumnValue)
-	return ptd
+// ParseResult is the result of parsing the string
+type ParseResult struct {
+	state parseState // for internal use
+
+	Transaction string                 // filled if this is a transaction statement (BEGIN/COMMIT) with the value of the transaction
+	Relation    string                 // filled if this is a DML statement with <schema>.<table>
+	Operation   string                 // filled if this is a DML statement with the name of the operation (INSERT/UPDATE/DELETE)
+	NoTupleData bool                   // true if this had no actual tuple data
+	Columns     map[string]ColumnValue // if a DML statement, the fields affected by the operation with their values and types
+	OldColumns  map[string]ColumnValue // if an UPDATE and REPLICA IDENTITY setting (FULL or USING INDEX both will add values here)
 }
 
-// Parse parses a string produced from the test_decoding logical replication plugin into the PTD structure, above
-func (parsed *ParsedTestDecoding) Parse() error {
-	err := parsed.ParsePrelude()
+// NewParseResult creates the structure that is filled by the Parse operation
+func NewParseResult(msg string) *ParseResult {
+	pr := new(ParseResult)
+	pr.state = parseState{msg: &msg, current: parseStateInitial, prev: parseStateInitial, tokenStart: 0, oldKey: false}
+	pr.Columns = make(map[string]ColumnValue)
+	pr.OldColumns = make(map[string]ColumnValue)
+	return pr
+}
+
+// Parse parses a string produced from the test_decoding logical replication plugin into the ParseResult struct, above
+func (pr *ParseResult) Parse() error {
+	err := pr.parse(false)
 	if err != nil {
 		return err
 	}
-	return parsed.ParseColumns()
+	return nil
 }
 
 // ParsePrelude allows more control over the parsing process
 // if you want to avoid parsing the string for tables/schemas (via a filtering mechansim)
 // you can run ParsePrelude to just fill the operation type, the schema and the table
-func (parsed *ParsedTestDecoding) ParsePrelude() error {
-	if len(*parsed.unparsed) < 5 {
-		return errors.Errorf("message too short: '%s'", string(*parsed.unparsed))
-	}
-
-	switch (*parsed.unparsed)[0:5] {
-	case "BEGIN":
-		fallthrough
-	case "COMMI":
-		parsed.Transaction = string(*parsed.unparsed)
-		return nil
-	case "table":
-		// hooray!
-	default:
-		return errors.Errorf("unknown logical message received: '%s'", string(*parsed.unparsed))
-	}
-
-	state := parseSchema
-	s := (*parsed.unparsed)[6:]
-	done := false
-
-	// parses the following:
-	// <schemaname>.<tablename>: <op>:
-	for !done {
-		for i := 0; i < len(s); i++ {
-			oldState := state
-
-			switch state {
-			// <schemaname>.<tablename>: <op>:
-			//             ^ parses up to here
-			case parseSchema:
-				if s[i] == '.' {
-					parsed.Schema = string(s[0:i])
-					s = s[i+1:] // skip the '.'
-					state = parseTable
-				}
-				// <schemaname>.<tablename>: <op>:
-				//                         ^ parses up to here
-			case parseTable:
-				if s[i] == ':' {
-					parsed.Table = string(s[0:i])
-					parsed.SchemaTable = fmt.Sprintf("%s.%s", parsed.Schema, parsed.Table)
-					s = s[i+2:] // skip the space, too
-					state = parseOp
-				}
-				// <schemaname>.<tablename>: <op>:
-				//                               ^ parses up to here
-			case parseOp:
-				if s[i] == ':' {
-					parsed.Operation = string(s[0:i])
-					s = s[i+2:] // skip the space, too
-					state = parseColumnName
-					done = true
-				}
-			}
-
-			if i >= (len(s) - 1) {
-				done = true
-				break
-			}
-
-			if oldState != state {
-				break
-			}
-		}
-	}
-
-	if state != parseColumnName {
-		panic("ended in an invalid state")
-	}
-
-	parsed.unparsed = &s
-
-	return nil
+func (pr *ParseResult) ParsePrelude() error {
+	return pr.parse(true)
 }
 
 // ParseColumns also does some cool shit
-func (parsed *ParsedTestDecoding) ParseColumns() error {
-	// BEGIN 30404
-	// table public.users: INSERT: id[integer]:568543 active[boolean]:false created_at[timestamp without time zone]:'2017-05-08 16:35:17.076434'
-	// COMMIT 30404
-
-	if parsed.Transaction != "" {
-		// no need to continue parsing if it's a transaction type
-		return nil
-	}
-
-	// now we handle the new and old tuple cases
-	// table public.users: UPDATE: old-key: id[integer]:568544 active[boolean]:true created_at[timestamp without time zone]:'2017-05-08 16:45:18.120996' new-tuple: id[integer]:568544 active[boolean]:true created_at[timestamp without time zone]:'2017-05-08 16:45:18.120996'
-	if parsed.Operation == "UPDATE" {
-		oldTupleIdx := strings.Index(*parsed.unparsed, "old-key: ")
-		newTupleIdx := strings.Index(*parsed.unparsed, "new-tuple: ")
-
-		if oldTupleIdx > -1 && newTupleIdx > -1 {
-			err := parseTupleColumns((*parsed.unparsed)[oldTupleIdx+9:newTupleIdx-1], &parsed.OldFields)
-			if err != nil {
-				return err
-			}
-			return parseTupleColumns((*parsed.unparsed)[newTupleIdx+11:], &parsed.Fields)
-		} else if oldTupleIdx > -1 {
-			return parseTupleColumns((*parsed.unparsed)[oldTupleIdx+9:], &parsed.OldFields)
-		} else if newTupleIdx > -1 {
-			return parseTupleColumns((*parsed.unparsed)[newTupleIdx+11:], &parsed.Fields)
-		}
-	}
-
-	return parseTupleColumns(*parsed.unparsed, &parsed.Fields)
+func (pr *ParseResult) ParseColumns() error {
+	return pr.parse(false)
 }
 
-func parseTupleColumns(tuple string, fields *map[string]ColumnValue) error {
-	var columnName string
-	var columnType string
-	var inQuote bool
-	var inDoubleQuote bool
+// based on https://github.com/citusdata/pg_warp/blob/9e69814b85e18fbe5a3c89f0e17d22583c9a398c/consumer/consumer.go
+// as opposed to a hackier earlier version
+func (pr *ParseResult) parse(preludeOnly bool) error {
+	state := pr.state
+	message := *state.msg
 
-	state := parseColumnName
-	s := tuple
-	done := false
+	if state.current == parseStateInitial {
+		if len(message) < 5 {
+			return errors.Errorf("message too short: %s", message)
+		}
 
-	for !done {
-		for i := 0; i < len(s); i++ {
-			oldState := state
-			lastChar := i == (len(s) - 1)
+		switch message[0:5] {
+		case "BEGIN":
+			fallthrough
+		case "COMMI":
+			fields := strings.Fields(message)
 
-			switch state {
-			case parseColumnName:
-				if s[i] == '[' {
-					columnName = string(s[0:i])
-					s = s[i+1:]
-					state = parseColumnType
-				} else if s[i] == '(' && s[i:len(s)] == "(no-tuple-data)" {
-					return nil
+			if len(fields) != 2 {
+				return errors.Errorf("unknown transaction message: %s", message)
+			}
+
+			pr.Operation = fields[0]
+			pr.Transaction = fields[1]
+
+			return nil
+		case "table":
+			// actual DML statement for which we need to parse out the table/operation
+		default:
+			return errors.Errorf("unknown logical message received: %s", message)
+		}
+
+		// we are parsing a table statement, so let's skip over the initial "table "
+		state.tokenStart = 6
+		state.current = parseStateRelation
+	}
+
+outer:
+	for i := 0; i <= len(message); i++ {
+		if i < state.tokenStart {
+			i = state.tokenStart - 1
+			continue
+		}
+
+		chr := byte('\000')
+		if i < len(message) {
+			chr = message[i]
+		}
+		chrNext := byte('\000')
+		if i+1 < len(message) {
+			chrNext = message[i+1]
+		}
+
+		switch state.current {
+		case parseStateNull:
+			return errors.Errorf("invalid parse state null: %+v", state)
+		case parseStateRelation:
+			if chr == ':' {
+				if chrNext != ' ' {
+					return errors.Errorf("invalid character ' ' at %d", i+1)
 				}
-			case parseColumnType:
-				if s[i] == ']' {
-					columnType = string(s[0:i])
-					s = s[i+2:] // skip ':' too
-					state = parseColumnValue
-					inQuote = false
-					inDoubleQuote = false
+				pr.Relation = message[state.tokenStart:i]
+				state.tokenStart = i + 2
+				state.current = parseStateOperation
+			} else if chr == '"' {
+				state.prev = state.current
+				state.current = parseStateEscapedIdentifier
+			}
+		case parseStateOperation:
+			if chr == ':' {
+				if chrNext != ' ' {
+					return errors.Errorf("invalid character ' ' at %d", i+1)
 				}
-			case parseColumnValue:
-				if s[i] == '\'' {
-					if i == 0 {
-						inQuote = true
-						s = s[i+1:]
-						break
-					} else if !inDoubleQuote && !lastChar && s[i+1] == '\'' {
-						inDoubleQuote = true
-					} else if inDoubleQuote {
-						inDoubleQuote = false
-					} else if inQuote && !inDoubleQuote {
-						(*fields)[columnName] = ColumnValue{String: string(s[0:i]), Quoted: inQuote, Type: columnType}
-						state = parseColumnName
+				pr.Operation = message[state.tokenStart:i]
+				state.tokenStart = i + 2
+				state.current = parseStateColumnName
 
-						if !lastChar {
-							s = s[i+2:]
-						}
-					}
-				} else if (s[i] == ' ' || lastChar) && !inQuote {
-					includeLastChar := 0
-					if lastChar {
-						includeLastChar = 1
-					}
-					(*fields)[columnName] = ColumnValue{String: string(s[0 : i+includeLastChar]), Quoted: inQuote, Type: columnType}
-					state = parseColumnName
+				if preludeOnly {
+					break outer
+				}
+			}
+		case parseStateColumnName:
+			if chr == '[' {
+				state.curColumnName = message[state.tokenStart:i]
+				state.tokenStart = i + 1
+				state.current = parseStateColumnType
+			} else if chr == ':' {
+				if message[state.tokenStart:i] == "old-key" {
+					state.oldKey = true
+				} else if message[state.tokenStart:i] == "new-tuple" {
+					state.oldKey = false
+				}
+				state.tokenStart = i + 2
+			} else if chr == '(' && message[state.tokenStart:len(message)] == "(no-tuple-data)" {
+				pr.NoTupleData = true
+				state.current = parseStateEnd
+			} else if chr == '"' {
+				state.prev = state.current
+				state.current = parseStateEscapedIdentifier
+			}
+		case parseStateColumnType:
+			if chr == ']' {
+				if chrNext != ':' {
+					return errors.Errorf("invalid character '%s' at %d", []byte{chrNext}, i+1)
+				}
+				state.curColumnType = message[state.tokenStart:i]
+				state.tokenStart = i + 2
+				state.current = parseStateColumnValue
+			} else if chr == '"' {
+				state.prev = state.current
+				state.current = parseStateEscapedIdentifier
+			} else if chr == '[' {
+				state.prev = state.current
+				state.current = parseStateOpenSquareBracket
+			}
+		case parseStateColumnValue:
+			if chr == '\000' || chr == ' ' {
+				quoted := state.prev == parseStateColumnQuotedValue
+				startStr := state.tokenStart
+				endStr := i
 
-					if !lastChar {
-						s = s[i+1:]
-					}
+				if quoted {
+					startStr++
+					endStr--
+				}
+
+				cv := ColumnValue{String: message[startStr:endStr], Quoted: quoted, Type: state.curColumnType}
+
+				if state.oldKey {
+					pr.OldColumns[state.curColumnName] = cv
+				} else {
+					pr.Columns[state.curColumnName] = cv
 				}
 			}
 
-			if lastChar {
-				done = true
-				break
+			if chr == '\000' {
+				state.current = parseStateEnd
+			} else if chr == ' ' {
+				state.tokenStart = i + 1
+				state.prev = state.current
+				state.current = parseStateColumnName
+			} else if chr == '\'' {
+				state.prev = state.current
+				state.current = parseStateColumnQuotedValue
 			}
-
-			if oldState != state {
-				break
+		case parseStateOpenSquareBracket:
+			if chr == ']' {
+				state.current = state.prev
+				state.prev = parseStateNull
+			}
+		case parseStateEscapedIdentifier:
+			if chr == '"' {
+				if chrNext == '"' {
+					i++
+				} else {
+					state.current = state.prev
+					state.prev = parseStateNull
+				}
+			}
+		case parseStateColumnQuotedValue:
+			if chr == '\'' {
+				if chrNext == '\'' {
+					i++
+				} else {
+					prev := state.prev
+					state.prev = state.current
+					state.current = prev
+				}
 			}
 		}
+	}
+
+	if (preludeOnly && state.current != parseStateColumnName) || (!preludeOnly && state.current != parseStateEnd) {
+		return errors.Errorf("invalid parser end state: %+v", state.current)
 	}
 
 	return nil
