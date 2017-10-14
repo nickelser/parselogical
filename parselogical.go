@@ -35,7 +35,7 @@ const (
 // Quoting is useful for handling values like val[text]:null or val[text]:unchanged-toast-datum,
 // which are special signifiers (denoting null and unchanged data, respectively).
 type ColumnValue struct {
-	String string
+	Value  string
 	Type   string
 	Quoted bool
 }
@@ -218,7 +218,9 @@ outer:
 					endStr--
 				}
 
-				cv := ColumnValue{String: message[startStr:endStr], Quoted: quoted, Type: state.curColumnType}
+				unescapedValue := strings.Replace(message[startStr:endStr], "''", "'", -1) // the value is escape-quoted to us
+
+				cv := ColumnValue{Value: unescapedValue, Quoted: quoted, Type: state.curColumnType}
 
 				if state.oldKey {
 					pr.OldColumns[state.curColumnName] = cv

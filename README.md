@@ -15,11 +15,11 @@ This will give you the `github.com/nickelser/parselogical` library, assuming you
 ## Usage
 
 ```go
-ptd := parselogical.NewParsedTestDecoding(walString)
+ptd := parselogical.NewParseResult(walString)
 ptd.Parse()
 
-// now you can access the fields updated via
-ptd.Fields // for example
+// now you can access the columns via
+ptd.Columns["id"] // for example
 ```
 
 TODO: more examples!
